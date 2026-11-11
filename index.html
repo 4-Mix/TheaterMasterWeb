@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Impara il copione</title>
+  <meta name="description" content="Prova a battute con la voce del telefono: carica il copione in PDF e recita la tua parte.">
+  <meta name="theme-color" content="#6B1A2B">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Copione">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header id="top">
+      <button id="back" class="top-btn" type="button" hidden>&lsaquo; Indietro</button>
+      <h1 id="title">Impara il copione</h1>
+    </header>
+    <main id="view"></main>
+  </div>
+  <noscript><p style="padding:24px">Serve JavaScript per usare questa app.</p></noscript>
+  <script src="lib/pdf.min.js"></script>
+  <script src="parser.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
