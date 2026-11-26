@@ -3,7 +3,11 @@
   'use strict';
 
   var Parser = window.ScriptParser;
+  var Pacing = window.Pacing;
+  var Training = window.Training;
   var synth = 'speechSynthesis' in window ? window.speechSynthesis : null;
+  var IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
   // ---------------------------------------------------------------- utilità
 
@@ -33,6 +37,25 @@
     el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
   }
 
+  // La memoria del telefono. Se il browser la blocca (navigazione privata) si usa una copia in RAM:
+  // l'app funziona lo stesso, ma i copioni non restano dopo la chiusura.
+  var storage = (function () {
+    try {
+      var k = '__copione_test';
+      localStorage.setItem(k, '1');
+      localStorage.removeItem(k);
+      return localStorage;
+    } catch (e) {
+      var mem = {};
+      return {
+        getItem: function (key) { return Object.prototype.hasOwnProperty.call(mem, key) ? mem[key] : null; },
+        setItem: function (key, v) { mem[key] = String(v); },
+        removeItem: function (key) { delete mem[key]; }
+      };
+    }
+  })();
+  var library = window.CopioneLibrary.createLibrary(storage);
+
   var LS = {
     get: function (key, fallback) {
       try {
@@ -59,7 +82,17 @@
     playing: false,
     waiting: false,            // tocca a me
     hint: false,
-    hideMine: LS.get('copione.hide', true),
+    studyMode: LS.get('copione.mode', LS.get('copione.hide', true) ? 'nascondi' : 'mostra'),   // mostra | nascondi | training
+    trainingLevel: LS.get('copione.level', 'medio'),
+    autoplay: LS.get('copione.autoplay', false),
+    autoSpeed: LS.get('copione.autospeed', 'normale'),
+    autoMs: 0,                 // durata dell'attesa automatica in corso (0 = nessuna)
+    autoStart: 0,
+    maskSeed: 1,               // cambia a ogni prova: cambiano i buchi del Training
+    currentScriptId: null,
+    lastCharacter: null,
+    notice: '',
+    speechIssue: '',
     voices: LS.get('copione.voices', {}),   // { NOME: { gender: 'donna'|'uomo', voice: voiceURI|null } }
     rate: LS.get('copione.rate', 1),
     loading: false,
@@ -165,8 +198,12 @@
     }).then(render);
   }
 
+  function newSeed() { return ((Date.now() ^ Math.floor(Math.random() * 4294967296)) >>> 0) || 1; }
+
   // Analizza il testo e passa alla scelta del personaggio. Ritorna false se non trova battute.
-  function openScript(text, title) {
+  // opts.saved: il copione viene già dalla libreria. opts.noSave: non salvarlo (esempio).
+  function openScript(text, title, opts) {
+    opts = opts || {};
     var script = Parser.parse(text);
     if (!script.characters.length) {
       state.error = 'Non ho trovato battute nel formato NOME: testo. ' +
@@ -174,15 +211,68 @@
       return false;
     }
     state.error = '';
+    state.notice = '';
     state.script = script;
     state.title = title || 'Copione';
     state.mine = null;
+    state.currentScriptId = null;
+    state.lastCharacter = null;
     state.selected = new Set(script.scenes.map(function (_, i) { return i; }));
     state.current = firstActive();
     state.view = 'characters';
-    LS.set('copione.last', { title: state.title, text: text });
+
+    if (opts.saved) {
+      state.currentScriptId = opts.saved.id;
+      state.lastCharacter = opts.saved.lastCharacter || null;
+      try { library.markOpened(opts.saved.id); } catch (e) { /* niente */ }
+    } else if (!opts.noSave) {
+      try {
+        var summary = plural(script.characters.length, 'personaggio', 'personaggi') + ' · ' +
+          plural(script.lines.length, 'riga', 'righe');
+        var entry = library.save(state.title, text, summary);
+        state.currentScriptId = entry.id;
+        state.lastCharacter = entry.lastCharacter || null;
+      } catch (e) {
+        state.notice = 'Non sono riuscito a salvare il copione nella memoria del telefono (spazio pieno o navigazione privata). ' +
+          'Lo puoi provare lo stesso, ma non resterà nell\'elenco.';
+      }
+    }
     return true;
   }
+
+  function openSaved(id) {
+    var entry = library.list().filter(function (e) { return e.id === id; })[0];
+    var text = entry ? library.readText(id) : null;
+    if (!entry || text === null) {
+      state.error = 'Questo copione non è più nella memoria del telefono.';
+      render();
+      return;
+    }
+    openScript(text, entry.title, { saved: entry });
+    render();
+  }
+
+  function deleteSaved(id) {
+    try { library.remove(id); } catch (e) { /* niente */ }
+    render();
+  }
+
+  // I copioni salvati con la versione precedente (uno solo) passano nella libreria.
+  (function migrateOld() {
+    var old = LS.get('copione.last', null);
+    if (!old || typeof old.text !== 'string') return;
+    try {
+      var sc = Parser.parse(old.text);
+      if (sc.characters.length) {
+        library.save(old.title || 'Copione', old.text,
+          plural(sc.characters.length, 'personaggio', 'personaggi') + ' · ' + plural(sc.lines.length, 'riga', 'righe'));
+      }
+      storage.removeItem('copione.last');
+    } catch (e) { /* si riprova la prossima volta */ }
+  })();
+
+  // Chiede al browser di non cancellare i dati dell'app quando manca spazio.
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* niente */ }
 
   function firstActive() {
     var a = Parser.activeIndices(state.script, state.selected);
@@ -246,13 +336,39 @@
     return { voice: fallback, pitch: base };
   }
 
-  // iOS permette di parlare solo dopo un gesto dell'utente: con questa "sblocco" la prima volta.
+  // Mezzo secondo di silenzio come file audio: serve a mettere la pagina in modalità "riproduzione".
+  function silentWavUrl() {
+    var n = 800, bytes = new Uint8Array(44 + n);
+    var dv = new DataView(bytes.buffer);
+    function str(o, t) { for (var i = 0; i < t.length; i++) bytes[o + i] = t.charCodeAt(i); }
+    str(0, 'RIFF'); dv.setUint32(4, 36 + n, true); str(8, 'WAVE'); str(12, 'fmt ');
+    dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, 8000, true); dv.setUint32(28, 8000, true); dv.setUint16(32, 1, true);
+    dv.setUint16(34, 8, true); str(36, 'data'); dv.setUint32(40, n, true);
+    for (var i = 0; i < n; i++) bytes[44 + i] = 128;
+    var bin = '';
+    for (var k = 0; k < bytes.length; k++) bin += String.fromCharCode(bytes[k]);
+    return 'data:audio/wav;base64,' + btoa(bin);
+  }
+
+  // iOS permette di parlare solo dopo un gesto dell'utente e, di default, tiene l'audio delle pagine web
+  // zitto quando il tasto laterale è sul silenzioso. Qui si fa quanto possibile da una pagina web.
   var unlocked = false;
   function unlockSpeech() {
-    if (!synth || unlocked) return;
+    if (!synth) return;
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) { /* niente */ }
+    if (unlocked) return;
     unlocked = true;
+    if (IS_IOS) {
+      try {
+        var a = new Audio(silentWavUrl());
+        a.volume = 0.01;
+        var pr = a.play();
+        if (pr && pr.catch) pr.catch(function () { /* niente */ });
+      } catch (e) { /* niente */ }
+    }
     try {
-      var u = new SpeechSynthesisUtterance('');
+      var u = new SpeechSynthesisUtterance(' ');
       u.volume = 0;
       synth.speak(u);
     } catch (e) { /* niente */ }
@@ -272,6 +388,16 @@
 
   var keepAlive = null; // tiene un riferimento all'ultima frase: evita che il browser la scarti
 
+  var ISSUE_TEXT = 'La voce non parte. Controlla che il volume sia alzato' +
+    (IS_IOS ? ' e che il tasto laterale non sia sul silenzioso (se si vede l\'arancione, è silenzioso)' : '') +
+    ', poi riprova.';
+  var issueHook = null;   // la finestra "Voci" ci si aggancia per mostrare lo stesso avviso
+  function setIssue(msg) {
+    state.speechIssue = msg;
+    renderControls();
+    if (issueHook) issueHook();
+  }
+
   function speakChunk(text, voice, pitch) {
     return new Promise(function (resolve) {
       if (!synth) { resolve(); return; }
@@ -281,18 +407,36 @@
       u.pitch = pitch;
       u.rate = state.rate;
       var done = false;
+      var started = false;
       var timer = null;
+      var startCheck = null;
       function finish() {
         if (done) return;
         done = true;
         clearTimeout(timer);
+        clearTimeout(startCheck);
         resolve();
       }
+      u.onstart = function () {
+        started = true;
+        clearTimeout(startCheck);
+        if (state.speechIssue) setIssue('');
+      };
       u.onend = finish;
-      u.onerror = finish;
+      u.onerror = function (e) {
+        var code = e && e.error ? e.error : '';
+        // "interrupted" e "canceled" sono normali quando metti in pausa
+        if (!started && code && code !== 'interrupted' && code !== 'canceled') {
+          setIssue(ISSUE_TEXT + ' (errore: ' + code + ')');
+        }
+        finish();
+      };
+      // Se la voce non parte entro qualche secondo, lo si dice invece di restare in silenzio.
+      startCheck = setTimeout(function () { if (!started && !done) setIssue(ISSUE_TEXT); }, 3500);
       // Rete di sicurezza: su alcuni telefoni "fine frase" a volte non arriva mai.
       timer = setTimeout(finish, 4000 + text.length * 180);
       keepAlive = u;
+      try { if (synth.paused) synth.resume(); } catch (e) { /* niente */ }
       synth.speak(u);
     });
   }
@@ -340,10 +484,29 @@
 
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
-  function waitForUser() {
-    state.waiting = true;
+  var autoTimer = null;
+
+  function stopAutoTimer() {
+    clearTimeout(autoTimer);
+    autoTimer = null;
+    state.autoMs = 0;
+  }
+
+  // Autoplay: dopo il tempo stimato dal testo della battuta si passa alla successiva da soli.
+  function startAutoTimer(line) {
+    stopAutoTimer();
+    if (!state.autoplay || !userResolve) return;
+    state.autoMs = Pacing.estimateLine(line, state.autoSpeed);
+    state.autoStart = Date.now();
+    autoTimer = setTimeout(userDone, state.autoMs);
     renderControls();
-    return new Promise(function (resolve) { userResolve = resolve; });
+  }
+
+  function waitForUser(line) {
+    state.waiting = true;
+    var p = new Promise(function (resolve) { userResolve = resolve; });
+    if (state.autoplay) startAutoTimer(line); else renderControls();
+    return p;
   }
 
   function start() {
@@ -362,6 +525,8 @@
     var pos = -1;
     for (var k = 0; k < active.length; k++) { if (active[k] >= state.current) { pos = k; break; } }
     if (pos < 0) pos = 0;
+    // Prova dall'inizio: nel Training i buchi cambiano posto
+    if (pos === 0) { state.maskSeed = newSeed(); paintAll(); }
 
     function step() {
       if (myRun !== runId) return;
@@ -379,7 +544,7 @@
 
       var turn;
       if (line.character === null) turn = sleep(700);
-      else if (line.character === state.mine) turn = waitForUser();
+      else if (line.character === state.mine) turn = waitForUser(line);
       else if (line.spoken) turn = speakLine(line, myRun);
       else turn = Promise.resolve();
 
@@ -394,6 +559,7 @@
   }
 
   function userDone() {
+    stopAutoTimer();
     if (!userResolve) return;
     var r = userResolve;
     userResolve = null;
@@ -409,6 +575,7 @@
 
   function pause() {
     runId++;
+    stopAutoTimer();
     if (synth) { try { synth.cancel(); } catch (e) { /* niente */ } }
     if (userResolve) { var r = userResolve; userResolve = null; r(); }
     state.playing = false;
@@ -435,7 +602,9 @@
     var line = state.script.lines[i];
     var isMine = line.character !== null && line.character === state.mine;
     var isCur = i === state.current;
-    var hidden = state.hideMine && isMine && i >= state.current && !(isCur && state.hint);
+    var upcoming = isMine && i >= state.current && !(isCur && state.hint);
+    var hidden = upcoming && state.studyMode === 'nascondi';
+    var training = upcoming && state.studyMode === 'training';
 
     el.className = 'line' + (line.character === null ? ' stage' : '') + (isMine ? ' mine' : '') + (isCur ? ' current' : '');
     if (isCur) el.setAttribute('aria-current', 'true'); else el.removeAttribute('aria-current');
@@ -443,6 +612,8 @@
     var body = h('div', { class: 'text' });
     if (hidden) {
       body.append(h('span', { class: 'veil', text: '••••••••  la tua battuta' }));
+    } else if (training) {
+      paintTraining(line, body);
     } else {
       line.segments.forEach(function (seg, k) {
         if (k) body.append(' ');
@@ -453,6 +624,27 @@
     el.replaceChildren();
     if (line.character !== null) el.append(h('div', { class: 'who', text: line.character }));
     el.append(body);
+  }
+
+  // Battuta con alcune parole coperte: p_______ (con l'iniziale) o ________ (senza).
+  function paintTraining(line, body) {
+    var spoken = Training.speechWords(line.segments);
+    var masked = Training.maskedIndices(spoken, state.trainingLevel, Training.lineSeed(state.maskSeed, line.index));
+    var showInitial = Training.LEVELS[state.trainingLevel].showInitial;
+    var n = 0;
+    line.segments.forEach(function (seg, k) {
+      if (k) body.append(' ');
+      if (seg.type === 'action') {
+        body.append(h('span', { class: 'action', text: '(' + seg.text + ')' }));
+        return;
+      }
+      Training.words(seg.text).forEach(function (word, j) {
+        if (j) body.append(' ');
+        if (masked.has(n)) body.append(h('span', { class: 'gap', 'aria-label': 'parola nascosta', text: Training.maskWord(word, showInitial) }));
+        else body.append(word);
+        n++;
+      });
+    });
   }
 
   function paintAll() {
@@ -485,9 +677,9 @@
       }
     });
     var area = h('textarea', { rows: '7', placeholder: 'Incolla qui il testo del copione' });
-    var last = LS.get('copione.last', null);
+    var saved = library.list();
 
-    var isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+    var isIOS = IS_IOS;
     var standalone = window.navigator.standalone === true ||
       (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
 
@@ -499,13 +691,9 @@
         h('div', { class: 'stack' },
           state.loading
             ? h('div', { class: 'spinner', role: 'status', 'aria-label': 'Sto leggendo il PDF' })
-            : h('label', { class: 'btn primary block' }, 'Scegli il PDF', fileInput),
+            : h('label', { class: 'btn primary block' }, 'Aggiungi un copione (PDF)', fileInput),
           state.error ? h('p', { class: 'error', role: 'alert', text: state.error }) : null,
-          last && !state.loading
-            ? h('button', {
-              class: 'btn block', type: 'button', onclick: function () { openScript(last.text, last.title); render(); }
-            }, 'Riapri “' + last.title + '”')
-            : null,
+          saved.length && !state.loading ? libraryList(saved) : null,
           h('details', { class: 'paste' },
             h('summary', { text: 'Incolla il testo' }),
             area,
@@ -517,7 +705,7 @@
             }, 'Usa questo testo')
           ),
           h('button', {
-            class: 'btn plain block', type: 'button', onclick: function () { openScript(SAMPLE, 'Il provino (esempio)'); render(); }
+            class: 'btn plain block', type: 'button', onclick: function () { openScript(SAMPLE, 'Il provino (esempio)', { noSave: true }); render(); }
           }, 'Prova con un esempio')
         ),
         isIOS && !standalone
@@ -528,8 +716,40 @@
     );
   }
 
+  function libraryList(saved) {
+    return h('section', { class: 'library', 'aria-label': 'I miei copioni' },
+      h('h3', { text: 'I miei copioni' }),
+      h('p', { class: 'note', text: 'Restano salvati nella memoria del telefono.' }),
+      saved.map(function (e) {
+        return h('div', { class: 'lib-item' },
+          h('button', { class: 'lib-open', type: 'button', onclick: function () { openSaved(e.id); } },
+            h('span', { class: 'lib-title', text: e.title }),
+            h('span', { class: 'lib-sub', text: (e.summary || '') + (e.lastCharacter ? ' · ultimo: ' + e.lastCharacter : '') })
+          ),
+          h('button', { class: 'btn plain small', type: 'button', onclick: function () { confirmDelete(e); } }, 'Elimina')
+        );
+      })
+    );
+  }
+
+  function confirmDelete(entry) {
+    var overlay = h('div', { class: 'backdrop', onclick: function (ev) { if (ev.target === overlay) closeOverlay(overlay); } });
+    overlay.append(h('div', { class: 'sheet', role: 'dialog', 'aria-label': 'Elimina il copione' },
+      h('div', { class: 'sheet-head' }, h('h3', { text: 'Eliminare il copione?' })),
+      h('div', { class: 'sheet-body' },
+        h('p', { text: '“' + entry.title + '” verrà tolto dalla memoria del telefono. Potrai aggiungerlo di nuovo dal PDF.' })),
+      h('div', { class: 'sheet-foot' },
+        h('button', { class: 'btn', type: 'button', onclick: function () { closeOverlay(overlay); } }, 'Annulla'),
+        h('button', { class: 'btn primary', type: 'button', onclick: function () { closeOverlay(overlay); deleteSaved(entry.id); } }, 'Elimina')
+      )
+    ));
+    document.body.append(overlay);
+  }
+
   function selectCharacter(name) {
     state.mine = name;
+    state.maskSeed = newSeed();
+    if (state.currentScriptId) { try { library.markOpened(state.currentScriptId, name); } catch (e) { /* niente */ } }
     state.current = firstActive();
     state.view = 'rehearsal';
     render();
@@ -550,10 +770,11 @@
           text: plural(names.length, 'personaggio', 'personaggi') + ', ' + plural(s.lines.length, 'riga', 'righe') +
             (s.scenes.length > 1 ? ', ' + plural(s.scenes.length, 'scena', 'scene') : '')
         }),
+        state.notice ? h('p', { class: 'error', role: 'alert', text: state.notice }) : null,
         h('div', { class: 'chars' }, names.map(function (n) {
           return h('button', { class: 'char', type: 'button', onclick: function () { selectCharacter(n); } },
             h('span', { class: 'name', text: n }),
-            h('span', { class: 'count', text: plural(counts[n], 'battuta', 'battute') })
+            h('span', { class: 'count', text: plural(counts[n], 'battuta', 'battute') + (n === state.lastCharacter ? ' · ultimo usato' : '') })
           );
         }))
       )
@@ -580,15 +801,11 @@
     ui.list = list;
     ui.controls = h('div', { class: 'controls' });
 
-    var hide = h('input', {
-      type: 'checkbox',
-      checked: state.hideMine,
-      onchange: function (e) {
-        state.hideMine = e.target.checked;
-        LS.set('copione.hide', state.hideMine);
-        paintAll();
-      }
-    });
+    var modebar = h('button', { class: 'modebar', type: 'button', onclick: openMode },
+      h('span', { class: 'k', text: 'Modo' }),
+      h('span', { class: 'v', text: modeSummary() }),
+      h('span', { class: 'chev', 'aria-hidden': 'true', text: '›' })
+    );
 
     var buttons = [];
     if (s.scenes.length > 1) {
@@ -605,7 +822,8 @@
         ),
         h('div', { class: 'row' }, buttons)
       ),
-      h('label', { class: 'check' }, hide, 'Nascondi le mie battute'),
+      modebar,
+      iosTip(),
       list,
       ui.controls
     );
@@ -619,6 +837,27 @@
     return view;
   }
 
+  function modeSummary() {
+    var parts = [];
+    if (state.studyMode === 'training') parts.push('Training ' + Training.LEVELS[state.trainingLevel].label.toLowerCase());
+    else parts.push(Training.MODES[state.studyMode].label);
+    parts.push(state.autoplay ? 'Autoplay ' + Pacing.SPEEDS[state.autoSpeed].label.toLowerCase() : 'Avanti a mano');
+    return parts.join(' · ');
+  }
+
+  // Su iPhone il tasto laterale sul silenzioso spegne la voce delle pagine web: lo si dice una volta sola.
+  function iosTip() {
+    if (!IS_IOS || LS.get('copione.iostip', false)) return null;
+    var box = h('div', { class: 'notice', role: 'note' },
+      h('span', { text: 'Non senti la voce? Alza il volume e controlla che il tasto laterale dell\'iPhone non sia sul silenzioso.' }),
+      h('button', {
+        class: 'btn plain small', type: 'button',
+        onclick: function () { LS.set('copione.iostip', true); if (box.parentNode) box.parentNode.removeChild(box); }
+      }, 'Ho capito')
+    );
+    return box;
+  }
+
   function renderControls() {
     if (!ui || !ui.controls) return;
     var c = ui.controls;
@@ -626,11 +865,17 @@
     if (ui.list) ui.list.classList.toggle('live', state.playing);
 
     if (state.error) c.append(h('p', { class: 'error', role: 'alert', text: state.error }));
+    if (state.speechIssue) c.append(h('p', { class: 'error', role: 'alert', text: state.speechIssue }));
     if (state.waiting) {
+      var elapsed = state.autoMs ? Date.now() - state.autoStart : 0;
       c.append(
         h('p', { class: 'your-turn', text: 'Tocca a te!' }),
+        state.autoMs
+          ? h('div', { class: 'auto-bar', role: 'progressbar', 'aria-label': 'Tempo per la tua battuta' },
+            h('span', { style: 'animation-duration:' + state.autoMs + 'ms;animation-delay:-' + elapsed + 'ms' }))
+          : null,
         h('div', { class: 'row' },
-          h('button', { class: 'btn primary', type: 'button', onclick: userDone }, 'Fatto, avanti'),
+          h('button', { class: 'btn primary', type: 'button', onclick: userDone }, state.autoMs ? 'Avanti subito' : 'Fatto, avanti'),
           h('button', { class: 'btn', type: 'button', onclick: showHint }, 'Suggerimento')
         )
       );
@@ -646,6 +891,87 @@
 
   function closeOverlay(el) {
     if (el && el.parentNode) el.parentNode.removeChild(el);
+  }
+
+  // ---------------------------------------------------------------- modo di prova
+
+  function openMode() {
+    var overlay = h('div', { class: 'backdrop', onclick: function (e) { if (e.target === overlay) done(); } });
+    var body = h('div', { class: 'sheet-body' });
+
+    function done() {
+      closeOverlay(overlay);
+      var bar = document.querySelector('.modebar .v');
+      if (bar) bar.textContent = modeSummary();
+    }
+
+    function radio(group, value, checked, label, desc, onpick) {
+      return h('label', { class: 'scene-row' },
+        h('input', { type: 'radio', name: group, value: value, checked: checked, onchange: function () { onpick(value); } }),
+        h('span', {}, h('span', { class: 't', text: label }), desc ? h('span', { class: 's', text: desc }) : null)
+      );
+    }
+
+    function draw() {
+      body.replaceChildren();
+      body.append(h('h4', { class: 'sub', text: 'Le tue battute' }));
+      Object.keys(Training.MODES).forEach(function (k) {
+        body.append(radio('mode', k, state.studyMode === k, Training.MODES[k].label, Training.MODES[k].description, function (v) {
+          state.studyMode = v;
+          LS.set('copione.mode', v);
+          paintAll();
+          draw();
+        }));
+      });
+
+      if (state.studyMode === 'training') {
+        body.append(h('h4', { class: 'sub', text: 'Quante parole nascondere' }));
+        Object.keys(Training.LEVELS).forEach(function (k) {
+          body.append(radio('level', k, state.trainingLevel === k, Training.LEVELS[k].label, Training.LEVELS[k].description, function (v) {
+            state.trainingLevel = v;
+            state.maskSeed = newSeed();
+            LS.set('copione.level', v);
+            paintAll();
+          }));
+        });
+      }
+
+      body.append(h('h4', { class: 'sub', text: 'Quando tocca a te' }));
+      body.append(h('label', { class: 'scene-row' },
+        h('input', {
+          type: 'checkbox', checked: state.autoplay,
+          onchange: function (e) {
+            state.autoplay = e.target.checked;
+            LS.set('copione.autoplay', state.autoplay);
+            if (state.waiting) {
+              if (state.autoplay) startAutoTimer(state.script.lines[state.current]);
+              else { stopAutoTimer(); renderControls(); }
+            }
+            draw();
+          }
+        }),
+        h('span', {},
+          h('span', { class: 't', text: 'Autoplay' }),
+          h('span', { class: 's', text: 'Passa da solo alla battuta successiva, dopo il tempo che serve per dire la tua.' }))
+      ));
+      if (state.autoplay) {
+        Object.keys(Pacing.SPEEDS).forEach(function (k) {
+          body.append(radio('speed', k, state.autoSpeed === k, 'Ritmo ' + Pacing.SPEEDS[k].label.toLowerCase(), '', function (v) {
+            state.autoSpeed = v;
+            LS.set('copione.autospeed', v);
+            if (state.waiting) startAutoTimer(state.script.lines[state.current]);
+          }));
+        });
+      }
+    }
+
+    overlay.append(h('div', { class: 'sheet', role: 'dialog', 'aria-label': 'Modo di prova' },
+      h('div', { class: 'sheet-head' }, h('h3', { text: 'Modo di prova' })),
+      body,
+      h('div', { class: 'sheet-foot' }, h('button', { class: 'btn primary', type: 'button', onclick: done }, 'Fatto'))
+    ));
+    document.body.append(overlay);
+    draw();
   }
 
   function openScenes() {
@@ -683,6 +1009,7 @@
       closeOverlay(overlay);
       state.selected = temp;
       state.current = firstActive();
+      state.maskSeed = newSeed();
       render();
     });
 
@@ -772,16 +1099,33 @@
     });
     rate.value = String(state.rate);
 
+    var issueNode = h('p', { class: 'error', role: 'alert', hidden: !state.speechIssue, text: state.speechIssue });
+    issueHook = function () { issueNode.textContent = state.speechIssue; issueNode.hidden = !state.speechIssue; };
+    var testBtn = h('button', {
+      class: 'btn block', type: 'button',
+      onclick: function () {
+        pause();
+        unlockSpeech();
+        loadVoices();
+        setIssue('');
+        var v = allVoices.filter(function (x) { return x.default; })[0] || allVoices[0] || null;
+        setTimeout(function () { speakChunk('Prova audio. Se mi senti, la voce funziona.', v, 1); }, 150);
+      }
+    }, 'Prova l\'audio');
+
     draw();
     panel.append(
       h('div', { id: 'panel-top', class: 'panel-top', style: 'background:var(--curtain);color:#fff;display:flex;align-items:center;justify-content:space-between;padding:env(safe-area-inset-top) 16px 0 16px;min-height:calc(56px + env(safe-area-inset-top))' },
         h('h3', { style: 'margin:0;font:600 20px var(--serif)', text: 'Voci' }),
-        h('button', { class: 'top-btn', type: 'button', onclick: function () { pause(); closeOverlay(panel); } }, 'Fatto')
+        h('button', { class: 'top-btn', type: 'button', onclick: function () { pause(); issueHook = null; closeOverlay(panel); } }, 'Fatto')
       ),
       h('div', { class: 'scroll' },
         allVoices.length === 0
           ? h('p', { class: 'note', text: 'Su questo telefono non trovo voci italiane. Su iPhone: Impostazioni, Accessibilità, Contenuto letto, Voci, Italiano. Intanto Donna e Uomo cambiano solo il tono.' })
           : h('p', { class: 'note', text: 'Donna e Uomo scelgono una voce adatta e ne regolano il tono. Con più voci italiane installate puoi sceglierne una a mano: premi Ascolta per provarla.' }),
+        h('div', { class: 'field' }, testBtn),
+        issueNode,
+        IS_IOS ? h('p', { class: 'note', text: 'Se non senti nulla: alza il volume e controlla che il tasto laterale dell\'iPhone non sia sul silenzioso (arancione visibile = silenzioso).' }) : null,
         h('div', { class: 'field' }, rateLabel, rate),
         list
       )
@@ -799,6 +1143,7 @@
     } else if (state.view === 'characters') {
       state.view = 'import';
       state.script = null;
+      state.currentScriptId = null;
     }
     render();
   }

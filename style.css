@@ -447,6 +447,50 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 32px
 
 .note { color: var(--muted); font-size: 14px; margin: 0 0 16px; max-width: 34em; }
 
+/* ---------- libreria, modo di prova, autoplay, training ---------- */
+input[type="radio"] { width: 22px; height: 22px; accent-color: var(--accent); margin: 0; }
+.scene-row input { flex: none; }
+.scene-row > span { min-width: 0; padding: 8px 0; }
+
+.library { margin-top: 8px; max-width: 28em; }
+.library h3 { margin: 8px 0 2px; font: 700 20px/1.2 var(--serif); }
+.library .note { margin-bottom: 8px; }
+.lib-item { display: flex; align-items: center; gap: 4px; border-top: 1px solid var(--rule); }
+.lib-open {
+  flex: 1; min-width: 0; text-align: left; background: none; border: 0; color: inherit; font: inherit;
+  padding: 12px 0; min-height: 56px; cursor: pointer; display: flex; flex-direction: column; gap: 2px;
+}
+.lib-open:active { background: var(--mine); }
+.lib-title { font: 700 18px/1.25 var(--serif); overflow-wrap: anywhere; }
+.lib-sub { color: var(--muted); font-size: 14px; }
+
+.modebar {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; text-align: left;
+  padding: 0 calc(16px + env(safe-area-inset-right)) 0 calc(16px + env(safe-area-inset-left));
+  background: none; border: 0; border-bottom: 1px solid var(--rule); color: inherit; font: inherit; font-size: 15px; cursor: pointer;
+}
+.modebar .k { font-weight: 700; }
+.modebar .v { flex: 1; color: var(--muted); }
+.modebar .chev { color: var(--muted); font-size: 22px; }
+
+.notice {
+  display: flex; align-items: center; gap: 8px; font-size: 14px;
+  padding: 8px calc(16px + env(safe-area-inset-right)) 8px calc(16px + env(safe-area-inset-left));
+  background: var(--spot-bg); color: #3b2c00;
+}
+.notice span { flex: 1; }
+
+.sheet-body .sub { margin: 14px 0 2px; font: 700 16px/1.2 var(--serif); color: var(--muted); }
+
+.auto-bar { height: 6px; border-radius: 3px; background: var(--rule); overflow: hidden; }
+.auto-bar span {
+  display: block; height: 100%; width: 100%; background: var(--spot);
+  transform-origin: left center; animation: auto-fill linear forwards;
+}
+@keyframes auto-fill { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+
+.line .gap { color: var(--accent-text); font-weight: 700; letter-spacing: .08em; }
+
 @media (prefers-reduced-motion: reduce) {
   .line { transition: none; }
   .spinner { animation-duration: 2.4s; }
