@@ -1,13 +1,16 @@
 // Service worker: tiene l'app in memoria così si apre anche senza internet.
 // Mostra subito la versione salvata e intanto scarica quella nuova (arriva alla riapertura successiva).
 // Se cambi i file dell'app, aumenta il numero di versione qui sotto.
-const CACHE = 'copione-v1';
+const CACHE = 'copione-v2';
 const FILES = [
   './',
   'index.html',
   'style.css',
   'app.js',
   'parser.js',
+  'pacing.js',
+  'training.js',
+  'library.js',
   'manifest.webmanifest',
   'lib/pdf.min.js',
   'lib/pdf.worker.min.js',
